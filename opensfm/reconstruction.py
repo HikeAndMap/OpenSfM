@@ -33,6 +33,17 @@ from opensfm.dataset_base import DataSetBase
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def _patch9_hms(seconds: float) -> str:
+    """[PATCH9] a duration as ODX's console shows it: 2 h 05 min, 3 min 12 s, 8 s."""
+    s = int(round(seconds or 0))
+    h, m = s // 3600, (s % 3600) // 60
+    if h:
+        return "%d h %02d min" % (h, m)
+    if m:
+        return "%d min %02d s" % (m, s % 60)
+    return "%d s" % s
+
+
 class ReconstructionAlgorithm(str, enum.Enum):
     INCREMENTAL = "incremental"
     TRIANGULATION = "triangulation"
@@ -923,6 +934,8 @@ def grow_reconstruction(
         )
         return reconstruction, report
 
+    # [PATCH9] the final adjustment (with the GCPs) is timed too
+    final_start = timer()
     align_gcp_result = align_reconstruction(
         reconstruction, gcp, config, bias_override=True)
     if not align_gcp_result and config["bundle_compensate_gps_bias"]:
@@ -938,6 +951,14 @@ def grow_reconstruction(
         bundle_with_gcp_annealing(reconstruction, camera_priors, rig_camera_priors,
                                   gcp, final_bundle_grid, config)
     remove_outliers(reconstruction, config)
+    final_seconds = timer() - final_start
+    report["final_bundle_seconds"] = final_seconds
+    gcp_count = len(gcp) if gcp else 0
+    report["final_bundle_gcp_count"] = gcp_count
+    logger.info(
+        "[PATCH9] Final adjustment%s: %d photos, %s"
+        % (" with %d GCPs" % gcp_count if gcp_count else "", len(reconstruction.shots), _patch9_hms(final_seconds))
+    )
 
     if config["filter_final_point_cloud"]:
         bad_condition = pysfm.filter_badly_conditioned_points(

@@ -5,8 +5,11 @@
 #include <sfm/retriangulation.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 namespace py = pybind11;
@@ -54,6 +57,120 @@ struct MapperConfig {
     c.local_bundle_max_shots = config["local_bundle_max_shots"].cast<int>();
     c.local_bundle_grid = config["local_bundle_grid"].cast<int>();
     return c;
+  }
+};
+
+// [PATCH9] Where the time of the reconstruction goes: adding photo after photo, each part of the loop is timed (how
+// often it ran, how long in all, its longest run). The console gets a line for every global bundle adjustment, a summary
+// every 500 photos and one at the end; the figures go into the report (reports/reconstruction.json, "timing").
+using GrowClock = std::chrono::steady_clock;
+
+double SecondsSince(GrowClock::time_point t0) {
+  return std::chrono::duration<double>(GrowClock::now() - t0).count();
+}
+
+std::string Hms(double seconds) {
+  long s = static_cast<long>(std::llround(seconds));
+  long h = s / 3600, m = (s % 3600) / 60;
+  std::stringstream out;
+  if (h > 0) {
+    out << h << " h " << std::setw(2) << std::setfill('0') << m << " min";
+  } else if (m > 0) {
+    out << m << " min " << std::setw(2) << std::setfill('0') << (s % 60)
+        << " s";
+  } else if (seconds >= 1.0 || seconds == 0.0) {
+    out << s << " s";
+  } else {
+    out << std::fixed << std::setprecision(2) << seconds << " s";
+  }
+  return out.str();
+}
+
+struct GrowPart {
+  const char* key;    // name in the report
+  const char* label;  // name in the console
+  long count = 0;
+  double seconds = 0.0;
+  double longest = 0.0;
+  void Add(double s) {
+    ++count;
+    seconds += s;
+    if (s > longest) {
+      longest = s;
+    }
+  }
+};
+
+struct GrowTiming {
+  GrowPart global_bundle{"global_bundle", "global adjustment"};
+  GrowPart local_bundle{"local_bundle", "local adjustment"};
+  GrowPart retriangulation{"retriangulation", "re-triangulation"};
+  GrowPart resection{"resection", "placing photos (resection)"};
+  GrowPart shot_poses{"shot_poses", "pose adjustment of new photos"};
+  GrowPart triangulation{"triangulation", "new points"};
+  GrowPart outliers{"outliers", "outlier removal"};
+  GrowPart candidates{"candidates", "candidate list"};
+  GrowPart alignment{"alignment", "alignment"};
+  GrowPart exif{"exif", "photo metadata"};
+  GrowClock::time_point start = GrowClock::now();
+  long global_after_retriangulation = 0;
+  long global_by_points = 0;
+  long global_by_interval = 0;
+
+  std::vector<GrowPart*> Parts() {
+    return {&global_bundle, &local_bundle, &retriangulation, &resection,
+            &shot_poses,    &triangulation, &outliers,       &candidates,
+            &alignment,     &exif};
+  }
+
+  std::string Summary(size_t shots) {
+    double total = SecondsSince(start), known = 0.0;
+    auto parts = Parts();
+    std::sort(parts.begin(), parts.end(), [](const GrowPart* a, const GrowPart* b) {
+      return a->seconds > b->seconds;
+    });
+    std::stringstream out;
+    out << shots << " photos in " << Hms(total) << ":";
+    bool first = true;
+    for (const auto* p : parts) {
+      known += p->seconds;
+      if (p->count == 0) {
+        continue;
+      }
+      out << (first ? " " : ", ") << p->label << " ";
+      if (p == &global_bundle || p == &local_bundle || p == &retriangulation) {
+        out << p->count << " x ";
+      }
+      out << Hms(p->seconds);
+      if (total > 0) {
+        out << " (" << static_cast<int>(std::lround(100.0 * p->seconds / total))
+            << " %)";
+      }
+      if (p == &global_bundle) {
+        out << ", longest " << Hms(p->longest);
+      }
+      first = false;
+    }
+    out << ", other " << Hms(std::max(0.0, total - known));
+    return out.str();
+  }
+
+  py::dict Report(size_t shots) {
+    py::dict report;
+    report["version"] = 1;
+    report["total_seconds"] = SecondsSince(start);
+    report["shots"] = shots;
+    report["global_bundle_after_retriangulation"] = global_after_retriangulation;
+    report["global_bundle_by_points"] = global_by_points;
+    report["global_bundle_by_interval"] = global_by_interval;
+    for (const auto* p : Parts()) {
+      py::dict part;
+      part["count"] = p->count;
+      part["seconds"] = p->seconds;
+      part["longest_seconds"] = p->longest;
+      report[p->key] = part;
+    }
+    return report;
   }
 };
 
@@ -631,10 +748,41 @@ py::dict ReconstructionGrower::Grow(
                             ? config["incremental_max_shots_count"].cast<int>()
                             : 0;
 
+  // [PATCH9] timing of the loop (see GrowTiming)
+  GrowTiming timing;
+  const std::string tag =
+      max_shots_count > 0 ? "[PATCH9] (trying a start pair) " : "[PATCH9] ";
+  size_t next_summary = 500;
+  auto run_global_bundle = [&](const char* why) {
+    auto t0 = GrowClock::now();
+    auto brep = BAHelpers::Bundle(map, camera_priors, rig_camera_priors,
+                                  empty_gcp, cfg.local_bundle_grid, config);
+    double seconds = SecondsSince(t0);
+    timing.global_bundle.Add(seconds);
+    LogBundleStats("GLOBAL", brep);
+    std::stringstream line;
+    line << tag << "Global adjustment " << timing.global_bundle.count << " ("
+         << why << "): " << brep["num_images"].cast<int>() << " photos, "
+         << brep["num_points"].cast<int>() << " points, " << Hms(seconds);
+    LogInfo(line.str());
+  };
+  auto run_alignment = [&]() {
+    auto t0 = GrowClock::now();
+    py_align(reconstruction, py::list(), config);
+    timing.alignment.Add(SecondsSince(t0));
+  };
+  auto run_outliers = [&](const std::vector<map::LandmarkId>& point_ids) {
+    auto t0 = GrowClock::now();
+    RemoveOutliersAndUpdate(map, config, candidates, point_ids);
+    timing.outliers.Add(SecondsSince(t0));
+  };
+
   std::stringstream ss;
   while (true) {
     // LogInfo("--------------------------------------------------------");
+    auto t_candidates = GrowClock::now();
     auto sorted_candidates = candidates.GetCandidates(images);
+    timing.candidates.Add(SecondsSince(t_candidates));
     bool any_success = false;
 
     for (const auto& [shot_id, count] : sorted_candidates) {
@@ -674,9 +822,11 @@ py::dict ReconstructionGrower::Grow(
       }
       const auto& cam_id = cam_it->second;
 
+      auto t_resect = GrowClock::now();
       auto resection = Resect(
           map, tracks_manager, shot_id, cam_id, cfg.resection_threshold,
           cfg.resection_min_inliers, rig_assignments, shot_camera_map, config);
+      timing.resection.Add(SecondsSince(t_resect));
 
       if (!resection.success) {
         continue;
@@ -696,6 +846,7 @@ py::dict ReconstructionGrower::Grow(
 
       // Set metadata from exif for all newly created shots
       {
+        auto t_exif = GrowClock::now();
         py::gil_scoped_acquire gil;
         for (const auto& ns : resection.new_shots) {
           if (!map.HasShot(ns)) {
@@ -706,6 +857,7 @@ py::dict ReconstructionGrower::Grow(
                                         reference.long_, reference.alt_);
           map.GetShot(ns).SetShotMeasurements(metadata);
         }
+        timing.exif.Add(SecondsSince(t_exif));
       }
 
       {
@@ -732,15 +884,19 @@ py::dict ReconstructionGrower::Grow(
 
       // Bundle shot poses for the new shots
       {
+        auto t_poses = GrowClock::now();
         std::unordered_set<map::ShotId> new_shot_set(
             resection.new_shots.begin(), resection.new_shots.end());
         BAHelpers::BundleShotPoses(map, new_shot_set, camera_priors,
                                    rig_camera_priors, config);
+        timing.shot_poses.Add(SecondsSince(t_poses));
       }
 
       // Add resected tracks to candidates
+      t_candidates = GrowClock::now();
       candidates.Add(resection.new_shots, resection.inlier_tracks, map,
                      tracks_manager);
+      timing.candidates.Add(SecondsSince(t_candidates));
 
       {
         std::string shot_names;
@@ -754,69 +910,85 @@ py::dict ReconstructionGrower::Grow(
       }
 
       // Triangulate new tracks (Fix 2: returns track set)
+      auto t_tri = GrowClock::now();
       auto new_tri_tracks = TriangulateNewTracks(map, tracks_manager,
                                                  resection.new_shots, config);
       total_triangulated += static_cast<int>(new_tri_tracks.size());
+      timing.triangulation.Add(SecondsSince(t_tri));
 
       // Add triangulated tracks to candidates (Fix 2)
       {
+        t_candidates = GrowClock::now();
         std::unordered_set<map::ShotId> empty_shots;
         candidates.Add(empty_shots, new_tri_tracks, map, tracks_manager);
+        timing.candidates.Add(SecondsSince(t_candidates));
       }
       size_t np = map.NumberOfLandmarks();
       size_t ns = map.NumberOfShots();
 
       if (retri_sched.Should(np)) {
         LogInfo("Re-triangulating");
-        py_align(reconstruction, py::list(), config);
+        run_alignment();
+        ++timing.global_after_retriangulation;
+        run_global_bundle("before re-triangulation");
         {
-          auto brep =
-              BAHelpers::Bundle(map, camera_priors, rig_camera_priors,
-                                empty_gcp, cfg.local_bundle_grid, config);
-          LogBundleStats("GLOBAL", brep);
+          auto t_retri = GrowClock::now();
+          sfm::retriangulation::ReconstructFromTracksManager(map, tracks_manager,
+                                                             config);
+          timing.retriangulation.Add(SecondsSince(t_retri));
         }
-        sfm::retriangulation::ReconstructFromTracksManager(map, tracks_manager,
-                                                           config);
+        t_candidates = GrowClock::now();
         candidates.Update(map, tracks_manager);
-        {
-          auto brep =
-              BAHelpers::Bundle(map, camera_priors, rig_camera_priors,
-                                empty_gcp, cfg.local_bundle_grid, config);
-          LogBundleStats("GLOBAL", brep);
-        }
+        timing.candidates.Add(SecondsSince(t_candidates));
+        ++timing.global_after_retriangulation;
+        run_global_bundle("after re-triangulation");
 
         // Remove outliers after retriangulation
-        RemoveOutliersAndUpdate(map, config, candidates);
+        run_outliers({});
 
         retri_sched.Done(map.NumberOfLandmarks());
         bundle_sched.Done(map.NumberOfLandmarks(), map.NumberOfShots());
 
       } else if (bundle_sched.Should(np, ns)) {
-        py_align(reconstruction, py::list(), config);
-        {
-          auto brep =
-              BAHelpers::Bundle(map, camera_priors, rig_camera_priors,
-                                empty_gcp, cfg.local_bundle_grid, config);
-          LogBundleStats("GLOBAL", brep);
+        // [PATCH9] what started it: the points grew by bundle_new_points_ratio, or bundle_interval photos were added
+        bool by_points = np >= bundle_sched.num_points_last *
+                                   bundle_sched.new_points_ratio;
+        if (by_points) {
+          ++timing.global_by_points;
+        } else {
+          ++timing.global_by_interval;
         }
+        run_alignment();
+        run_global_bundle(by_points ? "the points grew"
+                                    : "photos added since the last one");
 
         // Remove outliers after global bundle
-        RemoveOutliersAndUpdate(map, config, candidates);
+        run_outliers({});
 
         bundle_sched.Done(map.NumberOfLandmarks(), map.NumberOfShots());
 
       } else if (local_ba_radius > 0) {
         // Local bundle around newest shot
+        auto t_local = GrowClock::now();
         auto local_result = BAHelpers::BundleLocal(
             map, camera_priors, rig_camera_priors, empty_gcp, shot_id,
             cfg.local_bundle_grid, config);
+        timing.local_bundle.Add(SecondsSince(t_local));
         LogBundleStats("LOCAL", local_result.report);
-        RemoveOutliersAndUpdate(map, config, candidates,
-                                local_result.point_ids);
+        run_outliers(local_result.point_ids);
       }
 
       LogDebug("Reconstruction now has " + std::to_string(map.NumberOfShots()) +
               " shots.");
+
+      // [PATCH9] where the time went so far, every 500 photos (not while trying a start pair)
+      if (max_shots_count == 0 && map.NumberOfShots() >= next_summary) {
+        LogInfo(tag + "Reconstruction at " +
+                timing.Summary(map.NumberOfShots()));
+        while (next_summary <= map.NumberOfShots()) {
+          next_summary += 500;
+        }
+      }
 
       // Check max shots count
       if (max_shots_count > 0 &&
@@ -849,10 +1021,13 @@ py::dict ReconstructionGrower::Grow(
     }
   }
 
+  LogInfo(tag + "Adding photos done, " + timing.Summary(map.NumberOfShots()));
+
   py::dict report;
   report["num_resected"] = total_resected;
   report["num_triangulated"] = total_triangulated;
   report["num_iterations"] = iterations;
+  report["timing"] = timing.Report(map.NumberOfShots());
   py::list resected_list;
   for (const auto& s : resected_shots) {
     py::dict s_dict;
